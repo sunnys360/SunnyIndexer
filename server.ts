@@ -119,6 +119,70 @@ const VERIFIED_INDEXED_DOMAINS = new Set<string>(["buzz10.com"]);
 // In-memory cache for user-verified indexed URLs
 const VERIFIED_INDEXED_URLS = new Set<string>();
 
+// ==========================================
+// SECURE ADMIN AUTHENTICATION INFRASTRUCTURE
+// ==========================================
+interface AdminUserRecord {
+  username: string;
+  email: string;
+  passwordHash: string;
+  passwordSalt: string;
+  updatedAt: string;
+}
+
+interface ActiveSession {
+  token: string;
+  username: string;
+  email: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+function hashPassword(password: string, salt = crypto.randomBytes(16).toString("hex")): { hash: string; salt: string } {
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return { hash, salt };
+}
+
+function verifyPassword(password: string, hash: string, salt: string): boolean {
+  try {
+    const derived = crypto.scryptSync(password, salt, 64).toString("hex");
+    return crypto.timingSafeEqual(Buffer.from(derived, "hex"), Buffer.from(hash, "hex"));
+  } catch {
+    return false;
+  }
+}
+
+const AUTH_FILE_PATH = path.join(process.cwd(), ".admin_auth.json");
+
+let adminUser: AdminUserRecord;
+try {
+  if (fs.existsSync(AUTH_FILE_PATH)) {
+    const data = JSON.parse(fs.readFileSync(AUTH_FILE_PATH, "utf-8"));
+    if (data && data.adminUser) {
+      adminUser = data.adminUser;
+    }
+  }
+} catch {
+  // Use initial admin configuration below
+}
+
+if (!adminUser!) {
+  const { hash, salt } = hashPassword("Mytools@2101#$!");
+  adminUser = {
+    username: "sunnyindexer",
+    email: "sunnysingh64111@gmail.com",
+    passwordHash: hash,
+    passwordSalt: salt,
+    updatedAt: new Date().toISOString()
+  };
+  try {
+    fs.writeFileSync(AUTH_FILE_PATH, JSON.stringify({ adminUser }, null, 2));
+  } catch {}
+}
+
+const activeSessions = new Map<string, ActiveSession>();
+const loginAttempts = new Map<string, { count: number; lockedUntil: number }>();
+
 interface IndexingRequestPayload {
   urls: string[];
   method: 'all_methods' | 'googlebot_direct' | 'google_indexing_api' | 'indexnow_bing';
@@ -137,6 +201,196 @@ async function startServer() {
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   app.use(express.json({ limit: "50mb" }));
+
+  // ==========================================
+  // AUTHENTICATION MIDDLEWARE & ENDPOINTS
+  // ==========================================
+  const requireAdminAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.path === "/api/health") {
+      return next();
+    }
+
+    const authHeader = req.headers.authorization;
+    const customHeader = req.headers["x-admin-token"] as string | undefined;
+
+    let token = "";
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      token = authHeader.substring(7).trim();
+    } else if (customHeader) {
+      token = customHeader.trim();
+    }
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: "Authentication required. Please log in as admin.",
+        code: "UNAUTHORIZED"
+      });
+    }
+
+    const session = activeSessions.get(token);
+    if (!session) {
+      return res.status(401).json({
+        success: false,
+        error: "Session expired or invalid. Please log in again.",
+        code: "SESSION_EXPIRED"
+      });
+    }
+
+    if (Date.now() > session.expiresAt) {
+      activeSessions.delete(token);
+      return res.status(401).json({
+        success: false,
+        error: "Session expired. Please log in again.",
+        code: "SESSION_EXPIRED"
+      });
+    }
+
+    (req as any).adminSession = session;
+    next();
+  };
+
+  // Auth Routes
+  app.post("/api/auth/login", (req, res) => {
+    const rawIp = (req.headers["x-forwarded-for"] as string || req.socket.remoteAddress || "ip").split(",")[0].trim();
+    const now = Date.now();
+
+    // Brute-force protection
+    const attempt = loginAttempts.get(rawIp);
+    if (attempt && attempt.lockedUntil > now) {
+      const waitMinutes = Math.ceil((attempt.lockedUntil - now) / 60000);
+      return res.status(429).json({
+        success: false,
+        error: `Too many failed login attempts. Temporarily locked for security. Please try again in ${waitMinutes} minute(s).`
+      });
+    }
+
+    const { identifier, password } = req.body;
+    if (!identifier || !password) {
+      return res.status(400).json({ success: false, error: "Username/Email and password are required." });
+    }
+
+    const isMatch = (
+      identifier.trim().toLowerCase() === adminUser.username.toLowerCase() ||
+      identifier.trim().toLowerCase() === adminUser.email.toLowerCase()
+    );
+
+    const isPasswordValid = isMatch && verifyPassword(password, adminUser.passwordHash, adminUser.passwordSalt);
+
+    if (!isPasswordValid) {
+      const cur = loginAttempts.get(rawIp) || { count: 0, lockedUntil: 0 };
+      cur.count += 1;
+      if (cur.count >= 5) {
+        cur.lockedUntil = now + 15 * 60 * 1000;
+      }
+      loginAttempts.set(rawIp, cur);
+
+      return res.status(401).json({
+        success: false,
+        error: cur.count >= 5
+          ? "Too many failed attempts. Account access temporarily locked for 15 minutes."
+          : `Invalid username or password. (${5 - cur.count} attempt(s) remaining)`
+      });
+    }
+
+    loginAttempts.delete(rawIp);
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const session: ActiveSession = {
+      token,
+      username: adminUser.username,
+      email: adminUser.email,
+      createdAt: now,
+      expiresAt: now + 30 * 24 * 60 * 60 * 1000
+    };
+    activeSessions.set(token, session);
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        username: adminUser.username,
+        email: adminUser.email,
+        role: "admin"
+      }
+    });
+  });
+
+  app.get("/api/auth/me", (req, res) => {
+    const authHeader = req.headers.authorization;
+    const customHeader = req.headers["x-admin-token"] as string | undefined;
+
+    let token = "";
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      token = authHeader.substring(7).trim();
+    } else if (customHeader) {
+      token = customHeader.trim();
+    }
+
+    if (!token || !activeSessions.has(token)) {
+      return res.status(401).json({ authenticated: false });
+    }
+
+    const session = activeSessions.get(token)!;
+    if (Date.now() > session.expiresAt) {
+      activeSessions.delete(token);
+      return res.status(401).json({ authenticated: false, error: "Session expired" });
+    }
+
+    res.json({
+      authenticated: true,
+      user: {
+        username: session.username,
+        email: session.email,
+        role: "admin"
+      }
+    });
+  });
+
+  app.post("/api/auth/logout", (req, res) => {
+    const authHeader = req.headers.authorization;
+    const customHeader = req.headers["x-admin-token"] as string | undefined;
+
+    let token = "";
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      token = authHeader.substring(7).trim();
+    } else if (customHeader) {
+      token = customHeader.trim();
+    }
+
+    if (token) {
+      activeSessions.delete(token);
+    }
+    res.json({ success: true });
+  });
+
+  app.post("/api/auth/change-password", requireAdminAuth, (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ success: false, error: "Current and new password are required" });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ success: false, error: "New password must be at least 8 characters long" });
+    }
+
+    if (!verifyPassword(currentPassword, adminUser.passwordHash, adminUser.passwordSalt)) {
+      return res.status(401).json({ success: false, error: "Current password is incorrect" });
+    }
+
+    const { hash, salt } = hashPassword(newPassword);
+    adminUser.passwordHash = hash;
+    adminUser.passwordSalt = salt;
+    adminUser.updatedAt = new Date().toISOString();
+
+    try {
+      fs.writeFileSync(AUTH_FILE_PATH, JSON.stringify({ adminUser }, null, 2));
+    } catch {}
+
+    res.json({ success: true, message: "Password updated successfully" });
+  });
+
+  // Protect all Indexing & Diagnostic Engine APIs with Admin Authentication
+  app.use("/api/indexing", requireAdminAuth);
 
   // API Routes
   app.get("/api/health", (req, res) => {

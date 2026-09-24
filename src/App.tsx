@@ -11,6 +11,9 @@ import { IndexingResult, IndexCheckResult, LogEntry, QuotaStats, ConfigSettings,
 import { initAuth, getAccessToken } from './services/googleAuth';
 import { exportCheckResultsToGoogleSheets } from './services/googleWorkspace';
 import { SchemaBridgeModal } from './components/SchemaBridgeModal';
+import { AdminLogin } from './components/AdminLogin';
+import { ChangePasswordModal } from './components/ChangePasswordModal';
+import { checkAuthMe, logoutAdmin, AdminUser } from './services/auth';
 import {
   Bot,
   Settings,
@@ -25,7 +28,11 @@ import {
   Sparkles,
   Radio,
   Globe,
-  Briefcase
+  Briefcase,
+  LogOut,
+  KeyRound,
+  ShieldCheck,
+  UserCheck
 } from 'lucide-react';
 
 const DEFAULT_CONFIG: ConfigSettings = {
@@ -84,6 +91,11 @@ export default function App() {
     }
   ]);
 
+  const [adminUser, setAdminUser] = useState<AdminUser | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [isChangePasswordOpen, setIsChangePasswordOpen] = useState(false);
+  const [toastNotice, setToastNotice] = useState<string | null>(null);
+
   const [isRunning, setIsRunning] = useState(false);
   const [progress, setProgress] = useState<{ current: number; total: number; currentUrl: string } | null>(null);
   const [isConfigOpen, setIsConfigOpen] = useState(false);
@@ -95,6 +107,23 @@ export default function App() {
   const [showDeepChecker, setShowDeepChecker] = useState(false);
 
   const isCancelledRef = useRef(false);
+
+  // Verify Admin Authentication on Mount
+  useEffect(() => {
+    checkAuthMe().then((res) => {
+      if (res.authenticated && res.user) {
+        setAdminUser(res.user);
+      }
+      setIsAuthLoading(false);
+    });
+
+    const handleAuthExpired = () => {
+      setAdminUser(null);
+      addLog('warning', 'Admin session expired. Please log in again.', 'AUTH');
+    };
+    window.addEventListener('admin_auth_expired', handleAuthExpired);
+    return () => window.removeEventListener('admin_auth_expired', handleAuthExpired);
+  }, []);
 
   // Initialize Firebase Google Auth listener
   useEffect(() => {
@@ -518,6 +547,30 @@ export default function App() {
     addLog('info', 'Daily quota metrics reset to 25,000.', 'QUOTA');
   };
 
+  // 1. Loading Authorization State
+  if (isAuthLoading) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-8 h-8 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
+          <p className="text-xs text-slate-400 font-mono">Verifying Master Admin Authorization...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // 2. Restricted Admin Login Screen
+  if (!adminUser) {
+    return (
+      <AdminLogin
+        onLoginSuccess={(user) => {
+          setAdminUser(user);
+          addLog('success', `Admin logged in successfully: ${user.username} (${user.email})`, 'AUTH');
+        }}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-emerald-500/30 selection:text-emerald-300">
       {/* Top Header */}
@@ -579,9 +632,59 @@ export default function App() {
               <Settings className="w-3.5 h-3.5 text-slate-400" />
               <span className="hidden sm:inline">Settings</span>
             </button>
+
+            {/* Master Admin Profile & Logout */}
+            <div className="flex items-center gap-1.5 pl-2 border-l border-slate-800">
+              <div className="hidden lg:flex flex-col text-right">
+                <span className="text-xs font-semibold text-white flex items-center gap-1 justify-end">
+                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                  {adminUser.username}
+                </span>
+                <span className="text-[10px] text-slate-400 font-mono truncate max-w-[150px]">
+                  {adminUser.email}
+                </span>
+              </div>
+
+              <button
+                id="change-password-btn"
+                onClick={() => setIsChangePasswordOpen(true)}
+                className="p-1.5 text-slate-400 hover:text-white bg-slate-800/70 hover:bg-slate-800 border border-slate-700/70 rounded-lg transition cursor-pointer"
+                title="Change Master Admin Password"
+              >
+                <KeyRound className="w-3.5 h-3.5" />
+              </button>
+
+              <button
+                id="logout-btn"
+                onClick={async () => {
+                  await logoutAdmin();
+                  setAdminUser(null);
+                  addLog('info', 'Admin logged out.', 'AUTH');
+                }}
+                className="px-2.5 py-1.5 bg-red-950/40 hover:bg-red-900/50 text-red-300 border border-red-800/50 rounded-lg text-xs font-medium transition flex items-center gap-1 cursor-pointer"
+                title="Sign Out of Admin Portal"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Logout</span>
+              </button>
+            </div>
           </div>
         </div>
       </header>
+
+      {/* Global Success Notification Toast */}
+      {toastNotice && (
+        <div className="bg-emerald-500/15 border-b border-emerald-500/30 px-4 py-2 text-center text-xs text-emerald-300 font-medium flex items-center justify-center gap-2">
+          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+          <span>{toastNotice}</span>
+          <button
+            onClick={() => setToastNotice(null)}
+            className="ml-2 underline text-emerald-400 hover:text-emerald-200 cursor-pointer"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Main Single-Screen Application Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6">
@@ -728,6 +831,16 @@ export default function App() {
           addLog('info', `Imported ${newUrls.length} verified Job/Event Bridge URL(s) to submission queue.`, 'SCHEMA_BRIDGE');
         }}
         onAddLog={addLog}
+      />
+
+      {/* Change Master Password Modal */}
+      <ChangePasswordModal
+        isOpen={isChangePasswordOpen}
+        onClose={() => setIsChangePasswordOpen(false)}
+        onSuccessNotice={(msg) => {
+          setToastNotice(msg);
+          addLog('success', msg, 'AUTH');
+        }}
       />
     </div>
   );
