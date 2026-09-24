@@ -1,0 +1,7 @@
+{
+  "name": "Fast URL Indexer & Googlebot Dispatcher",
+  "description": "API-based URL indexing automation, Googlebot crawler triggers, real-time Google SERP index checker, live tracking dashboard, and Google Drive and Sheets integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
